@@ -1,5 +1,2 @@
-pyyaml
 pytz
 python-dotenv
-
-# brew install rclone ffmpeg
