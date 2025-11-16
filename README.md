@@ -154,21 +154,6 @@ The script creates some files to track progress (in `~/gphoto_logs/` by default)
 - `summary_*.json` - summary report
 - `failed.json` - list of files that couldn't be copied (usually damaged files)
 
-## Running Automatically (Optional)
-
-If you want the script to run every day automatically, you can set up a cron job:
-
-```bash
-crontab -e
-```
-
-Add this line (change the path to where you installed the script):
-```bash
-5 11 * * * /usr/local/bin/python3 /path/to/gphoto/main.py >> ~/gphoto_cron.log 2>&1
-```
-
-This runs the script every day at 11:05 AM (after Google's quota resets).
-
 ## License
 
 This project is provided as-is for personal use.
