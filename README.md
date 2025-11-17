@@ -25,6 +25,8 @@ pip install -r requirements.txt
 pip install -r requirements.txt
 ```
 
+**Note:** The `requirements.txt` includes `google-cloud-monitoring` which is needed for automatic quota synchronization via Google Cloud Monitoring API. It will be installed automatically when you run `pip install -r requirements.txt`.
+
 ### Step 2: Get Google API Keys
 
 You need to create API keys so the tool can access your Google Drive and Google Photos.
@@ -80,13 +82,21 @@ If both commands show folders without errors, you're good!
 
 ### Step 4: Configure the Script
 
-Create a file named `.env` in the project folder with this content:
+Create a file named `.env` in the project folder. Copy `.env.example` as a starting point:
 
-```env
-GDRIVE_REMOTE=gdrive
-GPHOTOS_REMOTE=gphotos
-SOURCE_PATH=Photo
+```bash
+cp .env.example .env
 ```
+
+Then edit `.env` and set your values:
+
+**Required:**
+- `GDRIVE_REMOTE` - Name of your rclone Google Drive remote (default: "gdrive")
+- `GPHOTOS_REMOTE` - Name of your rclone Google Photos remote (default: "gphotos")
+- `SOURCE_PATH` - Folder name in Google Drive where your photos are stored (default: "Photo")
+
+**Optional (recommended):**
+- `GOOGLE_CLOUD_PROJECT_ID` - Your Google Cloud project ID for automatic quota synchronization via Monitoring API
 
 Change `SOURCE_PATH` to the name of the folder in your Google Drive where your photos are stored.
 
@@ -97,10 +107,12 @@ python3 main.py
 ```
 
 That's it! The script will:
+- Display upload statistics at startup (uploaded files, remaining, progress)
 - Find all photos and videos in your Google Drive folder
 - Copy them to Google Photos
-- Organize them into albums by date
+- Organize them into albums by date (format: `YYYY_MM_photo` or `YYYY_MM_video`)
 - Show you progress as it works
+- Automatically stop before hitting daily quota limits
 
 ## How It Works
 
@@ -119,6 +131,24 @@ Google limits how much you can upload per day:
 - **50 GB of uploads per day**
 
 The script automatically stops before hitting these limits. If it stops, just wait until the next day (quota resets at midnight Pacific Time) and run it again - it will continue where it left off.
+
+### Quota Tracking
+
+The script tracks API quota usage to prevent exceeding Google's daily limits:
+
+- **Automatic Monitoring API sync** (recommended): Set `GOOGLE_CLOUD_PROJECT_ID` in `.env`. The script will automatically sync with Google Cloud Monitoring API to get real usage from metric `serviceruntime.googleapis.com/api/request_count` filtered by `photoslibrary.googleapis.com` service.
+  - **Note**: Metric updates with 2-15 minute delay (this is normal for Google Monitoring)
+  - **Note**: API requests have a 30-second timeout to prevent hanging
+  - **Setup**:
+    1. Set `GOOGLE_CLOUD_PROJECT_ID` in `.env`
+    2. Authenticate: `gcloud auth application-default login`
+    3. Enable Monitoring API: `gcloud services enable monitoring.googleapis.com`
+  - **Library**: The `google-cloud-monitoring` library is automatically installed via `requirements.txt`
+  - **Background sync**: Monitoring API sync happens silently in the background. Only significant quota changes (>10 requests) are logged to reduce noise in the output.
+  
+- **Local counter** (fallback): If Monitoring API is not configured, the script uses a local counter. Less accurate but works without additional setup.
+
+The script automatically displays upload statistics at startup, showing how many files have been uploaded, remaining files, and progress percentage.
 
 ## If Something Goes Wrong
 
@@ -153,6 +183,25 @@ The script creates some files to track progress (in `~/gphoto_logs/` by default)
 - `sync_*.log` - detailed log of what happened
 - `summary_*.json` - summary report
 - `failed.json` - list of files that couldn't be copied (usually damaged files)
+
+## Startup Statistics
+
+When you run the script, it displays upload statistics at startup:
+
+```
+=== Upload Statistics ===
+Uploaded: 8,757 files
+Failed: 2 files
+Remaining: 17,465 files
+Progress: 33.4%
+Top file types: .jpg (7,627), .mp4 (426), .mov (386), .cr2 (173), .png (138)
+```
+
+This helps you see:
+- How many files have already been uploaded
+- How many files remain
+- Overall progress percentage
+- Most common file types
 
 ## License
 

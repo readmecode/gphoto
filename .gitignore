@@ -55,10 +55,8 @@ summary_*.json
 
 # JSON files (except allowed ones)
 *.json
-!requirements.txt
 !package.json
 !package-lock.json
-!.env.example
 
 # rclone config (contains sensitive tokens)
 .rclone.conf

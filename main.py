@@ -57,17 +57,6 @@ UPLOAD_QUOTA_LIMIT = 53_687_091_200  # 50 GB in bytes
 WARNING_THRESHOLD = 0.8  # 80%
 CRITICAL_THRESHOLD = 0.9  # 90%
 STOP_THRESHOLD = 0.95  # 95% - more conservative approach, leaving a reserve
-# Real usage analysis: rclone makes many hidden API calls that Google counts:
-# - mediaItems.upload, mediaItems.batchCreate, token checks, MIME/type checks
-# - albums.list, albums.get, existence checks, duplicate checks
-# - Low-level retries (--low-level-retries=10)
-# - HEAD/OPTIONS requests, upload URL redirects
-# - rclone internal RPCs
-# Real range: 20-40 requests per photo, average ~38
-REQUESTS_UPLOAD_MEAN = 38  # Average requests per upload (realistic based on rclone behavior)
-REQUESTS_UPLOAD_STD = 6  # Standard deviation
-REQUESTS_FIRST_IN_ALBUM = 45  # First file in album requires more requests
-REQUESTS_LIST_ALBUMS = 2  # Album listing operations
 SAFETY_RESERVE = 300  # Request reserve for unexpected operations and retries
 
 STATE_FILE = Path(LOG_DIR) / "state.json"
@@ -100,14 +89,15 @@ except Exception:
     FAILED = {}
 
 DAILY_QUOTA_FILE = Path(LOG_DIR) / "daily_quota.json"
-REQUESTS_HISTORY_FILE = Path(LOG_DIR) / "requests_history.json"
 
 # Cache for tracking albums that have already been used (to avoid repeated checks)
 KNOWN_ALBUMS = set()
 
-# Rolling average for request estimation (last N uploads)
-REQUESTS_HISTORY_SIZE = 20  # Track last 20 uploads for rolling average
-REQUESTS_HISTORY = []  # Will be loaded from file or initialized empty
+# Quota synchronization tracking
+LAST_SYNC_TIME = None
+LAST_SYNC_UPLOADS = 0
+SYNC_INTERVAL_UPLOADS = 15  # Sync every 15 uploads
+SYNC_INTERVAL_SECONDS = 300  # Sync every 5 minutes
 
 METRICS = {
     "started": datetime.now().isoformat(),
@@ -179,11 +169,209 @@ def get_quota_reset_time():
     return reset_time, seconds_until_reset
 
 
+def get_real_quota_usage():
+    """Gets real quota usage via Google Cloud Monitoring API.
+    
+    Uses metric serviceruntime.googleapis.com/api/request_count filtered by
+    photoslibrary.googleapis.com service to get real request count for today.
+    Metric updates with 2-15 minute delay (normal for Google Monitoring).
+    
+    Returns (api_requests, uploaded_bytes) or None on error.
+    """
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
+    if not project_id:
+        # Don't log here - this is expected if GOOGLE_CLOUD_PROJECT_ID is not set
+        return None
+    
+    try:
+        from google.cloud import monitoring_v3
+        from google.oauth2 import service_account
+        import google.auth
+        from google.protobuf import timestamp_pb2
+    except ImportError as e:
+        # Library not installed
+        log(f"Monitoring API: required library not installed ({e})")
+        return None
+    
+    try:
+        # Get credentials
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if credentials_path and os.path.exists(credentials_path):
+            credentials = service_account.Credentials.from_service_account_file(
+                credentials_path,
+                scopes=["https://www.googleapis.com/auth/monitoring.read"]
+            )
+        else:
+            # Try to use Application Default Credentials
+            credentials, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/monitoring.read"]
+            )
+        
+        # Create Monitoring API client
+        client = monitoring_v3.MetricServiceClient(credentials=credentials)
+        project_name = f"projects/{project_id}"
+        
+        # Calculate time range: from start of day PST to current time
+        pst = pytz.timezone("America/Los_Angeles")
+        now_pst = datetime.now(pst)
+        today_start_pst = datetime.combine(now_pst.date(), dt_time.min)
+        today_start_pst = pst.localize(today_start_pst)
+        
+        # Convert to UTC for API
+        today_start_utc = today_start_pst.astimezone(pytz.UTC)
+        now_utc = now_pst.astimezone(pytz.UTC)
+        
+        # Create time interval via _pb (protobuf object)
+        interval = monitoring_v3.TimeInterval()
+        end_timestamp = timestamp_pb2.Timestamp(seconds=int(now_utc.timestamp()))
+        start_timestamp = timestamp_pb2.Timestamp(seconds=int(today_start_utc.timestamp()))
+        interval._pb.end_time.CopyFrom(end_timestamp)
+        interval._pb.start_time.CopyFrom(start_timestamp)
+        
+        # Create metric request
+        # Correct metric: serviceruntime.googleapis.com/api/request_count
+        # Filter by service: photoslibrary.googleapis.com
+        request = monitoring_v3.ListTimeSeriesRequest()
+        request.name = project_name
+        request.filter = (
+            'metric.type = "serviceruntime.googleapis.com/api/request_count" '
+            'AND resource.labels.service = "photoslibrary.googleapis.com"'
+        )
+        request.interval = interval
+        
+        # Configure aggregation via _pb
+        from google.protobuf import duration_pb2
+        alignment_period = duration_pb2.Duration(seconds=3600)  # 1 hour
+        request._pb.aggregation.alignment_period.CopyFrom(alignment_period)
+        request._pb.aggregation.per_series_aligner = monitoring_v3.Aggregation.Aligner.ALIGN_SUM
+        request._pb.aggregation.cross_series_reducer = monitoring_v3.Aggregation.Reducer.REDUCE_SUM
+        request.view = monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL
+        
+        # Execute request with timeout (30 seconds)
+        # timeout parameter accepts float (seconds) or None
+        response = client.list_time_series(request=request, timeout=30.0)
+        
+        # Sum values from time series
+        # REDUCE_SUM should sum all series, but if metric is split by methods,
+        # there may be multiple series - sum all points from all series
+        total_requests = 0
+        series_count = 0
+        for time_series in response:
+            series_count += 1
+            if not time_series.points:
+                continue
+            # Sum all points in the series (each point represents aggregated data for a period)
+            for point in time_series.points:
+                if hasattr(point.value, 'int64_value') and point.value.int64_value:
+                    total_requests += point.value.int64_value
+                elif hasattr(point.value, 'double_value') and point.value.double_value:
+                    total_requests += int(point.value.double_value)
+        
+        if total_requests > 0:
+            # Metric updates with 2-15 minute delay, but this is real usage
+            # Don't log every API call - only log errors
+            return total_requests, None
+        
+        # No data is normal (no requests today or metric not updated yet)
+        if series_count == 0:
+            log("Monitoring API: no time series found (no requests today or metric not updated yet)")
+            return None
+        
+        # If we have series but total_requests is 0, return None (no data yet)
+        return None
+    except Exception as e:
+        # Log error for diagnostics
+        error_type = type(e).__name__
+        error_msg = str(e)
+        import traceback
+        
+        if "DefaultCredentialsError" in error_type or "credentials" in error_msg.lower():
+            # Credentials not configured
+            log(f"Monitoring API: credentials not configured ({error_type})")
+            return None
+        
+        # Log other errors with full traceback for diagnostics
+        log(f"Monitoring API error: {error_type}: {error_msg}")
+        # Save traceback to log for debugging
+        tb_lines = traceback.format_exc().split('\n')
+        for line in tb_lines[:5]:  # First 5 lines of traceback
+            if line.strip():
+                log(f"  {line}")
+        return None
+
+
+def sync_quota_from_api():
+    """Syncs local counter with real value from Google Cloud Monitoring API.
+    
+    Returns True if sync successful, False otherwise.
+    Preserves uploaded_bytes value (not available from Monitoring API).
+    """
+    real_usage = get_real_quota_usage()
+    if real_usage is None:
+        return False
+    
+    api_requests, uploaded_bytes = real_usage
+    if api_requests is None:
+        return False
+    
+    # Load current data
+    current_date = get_current_pst_date()
+    date_str = current_date.isoformat()
+    
+    if DAILY_QUOTA_FILE.exists():
+        try:
+            with open(DAILY_QUOTA_FILE, "r") as f:
+                quota_data = json.load(f)
+            
+            if quota_data.get("date") == date_str:
+                old_requests = quota_data.get("api_requests", 0)
+                old_uploaded_bytes = quota_data.get("uploaded_bytes", 0)
+                # Sync if value changed or first sync
+                if api_requests != old_requests:
+                    diff = api_requests - old_requests
+                    # Only log significant changes (>10 requests) to reduce noise
+                    if abs(diff) > 10:
+                        log(f"Quota sync: {old_requests} → {api_requests} requests (diff: {diff:+d})")
+                    quota_data["api_requests"] = api_requests
+                    quota_data["quota_source"] = "api"
+                    # Preserve uploaded_bytes (not available from Monitoring API)
+                    if "uploaded_bytes" not in quota_data:
+                        quota_data["uploaded_bytes"] = old_uploaded_bytes
+                    save_daily_quota(quota_data)
+                    return True
+                else:
+                    # Value unchanged, but update source
+                    quota_data["quota_source"] = "api"
+                    # Preserve uploaded_bytes
+                    if "uploaded_bytes" not in quota_data:
+                        quota_data["uploaded_bytes"] = old_uploaded_bytes
+                    save_daily_quota(quota_data)
+                    return True
+        except Exception as e:
+            log(f"Warning: Failed to sync quota: {e}")
+            return False
+    else:
+        # File doesn't exist, create new with API data
+        quota_data = {
+            "date": date_str,
+            "api_requests": api_requests,
+            "uploaded_bytes": 0,  # New file, start from 0
+            "quota_source": "api"
+        }
+        save_daily_quota(quota_data)
+        return True
+    
+    return False
+
+
 def load_daily_quota():
     """Loads daily quotas, resets if new day.
     
-    Supports manual synchronization via INITIAL_API_REQUESTS environment variable
-    to sync with actual Google Cloud Console usage.
+    Sync priority:
+    1. Real value from Google Cloud Monitoring API (if configured)
+    2. Local saved value
+    
+    Preserves uploaded_bytes on restart (only resets on new day).
     """
     current_date = get_current_pst_date()
     date_str = current_date.isoformat()
@@ -195,7 +383,16 @@ def load_daily_quota():
             initial_requests = int(initial_requests)
             log(f"Manual sync: using {initial_requests} as initial API requests count")
         except (ValueError, TypeError):
-            log(f"Warning: Invalid INITIAL_API_REQUESTS value: {initial_requests}, ignoring")
+            log(f"Warning: Invalid manual sync value, ignoring")
+            initial_requests = None
+
+    # Attempt to get real value from API at startup
+    real_usage = get_real_quota_usage()
+    api_requests_from_api = None
+    if real_usage is not None:
+        api_requests_from_api, _ = real_usage
+        # Only log at startup if we got a value (silent sync during runtime)
+        # Note: If real_usage is None, error details are already logged in get_real_quota_usage()
 
     if DAILY_QUOTA_FILE.exists():
         try:
@@ -205,23 +402,75 @@ def load_daily_quota():
             # Check if it's a new day
             if quota_data.get("date") == date_str:
                 api_requests = quota_data.get("api_requests", 0)
-                uploaded_bytes = quota_data.get("uploaded_bytes", 0)
+                uploaded_bytes = quota_data.get("uploaded_bytes", 0)  # Preserve on restart
                 
-                # If manual sync is provided and it's higher than current count, use it
-                if initial_requests is not None and initial_requests > api_requests:
-                    log(f"Syncing API requests: {api_requests} → {initial_requests}")
+                # Priority: API > manual sync > local value
+                # Ensure uploaded_bytes is preserved in quota_data
+                if "uploaded_bytes" not in quota_data:
+                    quota_data["uploaded_bytes"] = uploaded_bytes
+                
+                if api_requests_from_api is not None:
+                    # Always update quota_source to "api" if Monitoring API is available
+                    needs_save = False
+                    if api_requests_from_api != api_requests:
+                        # Only log significant changes (>10 requests) or at startup
+                        diff = api_requests_from_api - api_requests
+                        if abs(diff) > 10:
+                            log(f"Quota sync: {api_requests} → {api_requests_from_api} requests (diff: {diff:+d})")
+                        api_requests = api_requests_from_api
+                        quota_data["api_requests"] = api_requests
+                        needs_save = True
+                    # Update quota_source to "api" even if values match (Monitoring API is working)
+                    if quota_data.get("quota_source") != "api":
+                        quota_data["quota_source"] = "api"
+                        needs_save = True
+                    if needs_save:
+                        save_daily_quota(quota_data)
+                    # Return updated values
+                    return api_requests, uploaded_bytes
+                elif initial_requests is not None and initial_requests > api_requests:
+                    log(f"Syncing from manual: {api_requests} → {initial_requests} requests")
                     api_requests = initial_requests
                     quota_data["api_requests"] = api_requests
+                    quota_data["quota_source"] = "manual"
+                    save_daily_quota(quota_data)
+                elif "quota_source" not in quota_data:
+                    quota_data["quota_source"] = "local"
                     save_daily_quota(quota_data)
                 
                 return api_requests, uploaded_bytes
         except Exception:
             pass
 
-    # New day or file doesn't exist - reset or use manual sync
-    api_requests = initial_requests if initial_requests is not None else 0
-    quota_data = {"date": date_str, "api_requests": api_requests, "uploaded_bytes": 0}
+    # New day or file doesn't exist - reset or use sync values
+    # For new day, uploaded_bytes should be 0 (correct)
+    # For missing file, uploaded_bytes should be 0 (correct)
+    if api_requests_from_api is not None:
+        api_requests = api_requests_from_api
+        quota_source = "api"
+    elif initial_requests is not None:
+        api_requests = initial_requests
+        quota_source = "manual"
+    else:
+        api_requests = 0
+        quota_source = "local"
+    
+    quota_data = {
+        "date": date_str,
+        "api_requests": api_requests,
+        "uploaded_bytes": 0,  # New day or new file - reset to 0 (correct)
+        "quota_source": quota_source
+    }
     save_daily_quota(quota_data)
+    
+    if quota_source == "local":
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
+        if project_id:
+            log("Warning: Using local quota counter. Monitoring API sync unavailable (check credentials/permissions).")
+            log("Note: Monitoring API provides real usage with 2-15 min delay. Fallback to local counter.")
+        else:
+            log("Warning: Using local quota counter. Set GOOGLE_CLOUD_PROJECT_ID for Monitoring API sync.")
+    
     return api_requests, 0
 
 
@@ -235,59 +484,6 @@ def save_daily_quota(quota_data=None):
         }
     with open(DAILY_QUOTA_FILE, "w") as f:
         json.dump(quota_data, f, indent=2)
-
-
-def load_requests_history():
-    """Loads requests history for rolling average calculation."""
-    global REQUESTS_HISTORY
-    current_date = get_current_pst_date()
-    date_str = current_date.isoformat()
-    
-    if REQUESTS_HISTORY_FILE.exists():
-        try:
-            with open(REQUESTS_HISTORY_FILE, "r") as f:
-                history_data = json.load(f)
-                # Reset history if it's a new day
-                if history_data.get("date") == date_str:
-                    REQUESTS_HISTORY = history_data.get("history", [])
-                else:
-                    REQUESTS_HISTORY = []
-        except Exception:
-            REQUESTS_HISTORY = []
-    else:
-        REQUESTS_HISTORY = []
-    
-    return REQUESTS_HISTORY
-
-
-def save_requests_history():
-    """Saves requests history for rolling average."""
-    current_date = get_current_pst_date()
-    date_str = current_date.isoformat()
-    history_data = {
-        "date": date_str,
-        "history": REQUESTS_HISTORY[-REQUESTS_HISTORY_SIZE:],  # Keep only last N
-    }
-    with open(REQUESTS_HISTORY_FILE, "w") as f:
-        json.dump(history_data, f, indent=2)
-
-
-def add_to_requests_history(requests_count):
-    """Adds a request count to history and updates rolling average."""
-    global REQUESTS_HISTORY
-    REQUESTS_HISTORY.append(requests_count)
-    # Keep only last N entries
-    if len(REQUESTS_HISTORY) > REQUESTS_HISTORY_SIZE:
-        REQUESTS_HISTORY = REQUESTS_HISTORY[-REQUESTS_HISTORY_SIZE:]
-    save_requests_history()
-
-
-def get_rolling_average_requests():
-    """Calculates rolling average requests per upload from history."""
-    if not REQUESTS_HISTORY:
-        return REQUESTS_UPLOAD_MEAN  # Default to mean if no history
-    
-    return sum(REQUESTS_HISTORY) / len(REQUESTS_HISTORY)
 
 
 def increment_api_request():
@@ -442,18 +638,39 @@ def is_nonrecoverable_media_error(message: str) -> bool:
 def run_cmd(cmd, retries=3, cooldown=5, is_gphotos_api=False, estimated_requests=1):
     """Safe rclone call with 429/Quota exceeded handling.
     
-    Uses estimated requests for quota tracking. After successful execution, updates
-    the counter and adds to rolling average history for future estimates.
+    Uses real value from Google Cloud Monitoring API.
+    Periodically syncs with API to get current value.
     On errors (except quota errors), does NOT count requests (they weren't successful).
 
     Args:
-        estimated_requests: Estimated number of API requests (based on rolling average)
+        estimated_requests: Legacy parameter, kept for API compatibility (not used)
     Returns:
-        tuple: (stdout, estimated_requests_used) if is_gphotos_api, else (stdout, 0)
+        tuple: (stdout, 0)
     """
+    global LAST_SYNC_TIME, LAST_SYNC_UPLOADS
+    
     if is_gphotos_api:
-        # Check quota before operation (using projection for planning)
-        if not check_api_quota(estimated_requests):
+        # Sync with API before check (periodically)
+        current_time = time.time()
+        should_sync = False
+        
+        if LAST_SYNC_TIME is None:
+            # First sync
+            should_sync = True
+        elif (current_time - LAST_SYNC_TIME) >= SYNC_INTERVAL_SECONDS:
+            # Enough time passed
+            should_sync = True
+        elif (LAST_SYNC_UPLOADS + 1) >= SYNC_INTERVAL_UPLOADS:
+            # Enough uploads passed
+            should_sync = True
+        
+        if should_sync:
+            if sync_quota_from_api():
+                LAST_SYNC_TIME = current_time
+                LAST_SYNC_UPLOADS = 0
+        
+        # Check quota before operation (use real value from Monitoring API)
+        if not check_api_quota(0):  # 0 because real value is already in counter
             reset_time, seconds_until_reset = get_quota_reset_time()
             raise QuotaExceededError(reset_time, seconds_until_reset)
 
@@ -462,39 +679,36 @@ def run_cmd(cmd, retries=3, cooldown=5, is_gphotos_api=False, estimated_requests
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode == 0:
-            # SUCCESS - count estimated requests and update history
+            # SUCCESS - do NOT increment counter, it's updated via API sync
             if is_gphotos_api:
-                # Increment counter by estimated amount
-                for _ in range(estimated_requests):
-                    increment_api_request()
+                # Increment upload counter for periodic sync
+                LAST_SYNC_UPLOADS += 1
                 
-                # Add to history for rolling average (this will improve future estimates)
-                add_to_requests_history(estimated_requests)
-                
-                # Log expected vs estimated (for now they're the same, but will diverge as rolling avg updates)
-                rolling_avg = get_rolling_average_requests()
-                log(
-                    f"Request usage: estimated {estimated_requests} | rolling avg {rolling_avg:.1f}"
-                )
-            else:
-                estimated_requests = 0
+                # Periodic sync after successful operation
+                current_time = time.time()
+                if (LAST_SYNC_TIME is None or 
+                    (current_time - LAST_SYNC_TIME) >= SYNC_INTERVAL_SECONDS or
+                    LAST_SYNC_UPLOADS >= SYNC_INTERVAL_UPLOADS):
+                    if sync_quota_from_api():
+                        LAST_SYNC_TIME = current_time
+                        LAST_SYNC_UPLOADS = 0
             
-            return result.stdout.strip(), estimated_requests
+            return result.stdout.strip(), 0
 
         stderr = result.stderr
         last_error = stderr
 
         # Check for daily quota limit
         if is_daily_quota_exceeded(stderr):
-            # Quota exceeded - some requests were likely made, count them
-            # Use estimated_requests as approximation
+            # Quota exceeded - sync to get real value
             if is_gphotos_api:
-                for _ in range(estimated_requests):
-                    increment_api_request()
+                sync_quota_from_api()
             
             reset_time, seconds_until_reset = get_quota_reset_time()
             hours_until_reset = seconds_until_reset / 3600
+            api_requests, _ = load_daily_quota()
             log(f"Daily quota limit reached (10,000 requests/day)")
+            log(f"Current usage: {api_requests}/{API_QUOTA_LIMIT}")
             log(
                 f"Quota will reset at: {reset_time.strftime('%Y-%m-%d %H:%M:%S PST')}"
             )
@@ -514,7 +728,7 @@ def run_cmd(cmd, retries=3, cooldown=5, is_gphotos_api=False, estimated_requests
 
         # Check quota after failed attempt (for planning next retry)
         if is_gphotos_api:
-            if not check_api_quota(estimated_requests):
+            if not check_api_quota(0):  # Use real value
                 reset_time, seconds_until_reset = get_quota_reset_time()
                 raise QuotaExceededError(reset_time, seconds_until_reset)
 
@@ -585,7 +799,10 @@ def ensure_album(album_name):
 
 
 def upload_file(relpath, album, file_size):
-    """Uploads file from GDrive → GPhotos with request optimization."""
+    """Uploads file from GDrive → GPhotos.
+    
+    Uses real quota value from Google Cloud Monitoring API.
+    """
     # Check upload volume quota before upload
     if not check_upload_quota(file_size):
         reset_time, seconds_until_reset = get_quota_reset_time()
@@ -594,17 +811,8 @@ def upload_file(relpath, album, file_size):
     src = f"{GDRIVE}:{SOURCE_PATH}/{relpath}"
     dest = f"{GPHOTOS}:album/{album}/"  # ← added 'album/'
 
-    # Determine if this is the first file in album (requires more requests)
+    # Determine if this is the first file in album
     is_first_in_album = ensure_album(album)
-
-    # Estimate number of requests using rolling average if available, otherwise use defaults
-    rolling_avg = get_rolling_average_requests()
-    if is_first_in_album:
-        # First file in album: use rolling average + extra for album operations
-        estimated_requests = int(rolling_avg + REQUESTS_LIST_ALBUMS)
-    else:
-        # Regular upload: use rolling average
-        estimated_requests = int(rolling_avg)
 
     cmd = [
         "rclone",
@@ -627,12 +835,12 @@ def upload_file(relpath, album, file_size):
     ]
 
     try:
-        _, actual_requests = run_cmd(
+        _ = run_cmd(
             cmd,
             retries=5,
             cooldown=30,
             is_gphotos_api=True,
-            estimated_requests=estimated_requests,
+            estimated_requests=1,  # Legacy parameter, kept for compatibility
         )
         # Increment uploaded bytes counter after successful upload
         increment_upload_bytes(file_size)
@@ -641,7 +849,7 @@ def upload_file(relpath, album, file_size):
             json.dump(list(DONE), state_file)
         METRICS["uploaded_files"] += 1
         METRICS["by_album"][album] += 1
-        log(f"Success: {relpath} → {album}")
+        log(f"✓ Success: {relpath} → {album}")
     except QuotaExceededError:
         # Re-raise QuotaExceededError to stop the loop
         raise
@@ -670,44 +878,128 @@ def upload_file(relpath, album, file_size):
 def save_summary():
     METRICS["finished"] = datetime.now().isoformat()
     METRICS["duration_sec"] = round(time.time() - START_TIME, 2)
-    METRICS["albums_created"] = sorted(list(METRICS["albums_created"]))
     # Save current quotas to metrics
     api_requests, uploaded_bytes = load_daily_quota()
     METRICS["api_requests_used"] = api_requests
     METRICS["uploaded_bytes"] = uploaded_bytes
     METRICS["failed_files"] = FAILED
+    # Create a copy for JSON serialization (sets are not JSON serializable)
+    metrics_copy = METRICS.copy()
+    metrics_copy["albums_created"] = sorted(list(METRICS["albums_created"]))
     with open(SUMMARY_PATH, "w") as f:
-        json.dump(METRICS, f, indent=2, ensure_ascii=False)
+        json.dump(metrics_copy, f, indent=2, ensure_ascii=False)
     log(f"Report saved: {SUMMARY_PATH}")
 
 
+def get_upload_statistics(total_files=None):
+    """Calculates and returns upload statistics.
+    
+    Args:
+        total_files: Total number of files to process (if None, only shows uploaded/failed)
+    
+    Returns:
+        dict with statistics
+    """
+    uploaded_count = len(DONE)
+    failed_count = len(FAILED)
+    
+    stats = {
+        "uploaded": uploaded_count,
+        "failed": failed_count,
+    }
+    
+    if total_files is not None:
+        remaining = total_files - uploaded_count - failed_count
+        progress = (uploaded_count / total_files * 100) if total_files > 0 else 0
+        stats["remaining"] = remaining
+        stats["progress"] = progress
+        stats["total"] = total_files
+    
+    # Count files by extension
+    extensions = {}
+    for file in DONE:
+        if '.' in file:
+            ext = '.' + file.split('.')[-1].lower()
+            extensions[ext] = extensions.get(ext, 0) + 1
+    
+    # Sort by count and get top file types
+    top_extensions = sorted(extensions.items(), key=lambda x: x[1], reverse=True)[:7]
+    stats["top_file_types"] = top_extensions
+    
+    return stats
+
+
+def log_upload_statistics(total_files=None):
+    """Logs upload statistics in a formatted way."""
+    stats = get_upload_statistics(total_files)
+    
+    log("=== Upload Statistics ===")
+    log(f"Uploaded: {stats['uploaded']:,} files")
+    log(f"Failed: {stats['failed']:,} files")
+    
+    if total_files is not None:
+        log(f"Remaining: {stats['remaining']:,} files")
+        log(f"Progress: {stats['progress']:.1f}%")
+    
+    if stats["top_file_types"]:
+        file_types_str = ", ".join([f"{ext} ({count:,})" for ext, count in stats["top_file_types"]])
+        log(f"Top file types: {file_types_str}")
+
+
 def main():
-    global START_TIME
+    global START_TIME, LAST_SYNC_TIME
     START_TIME = time.time()
+    LAST_SYNC_TIME = None  # Initialize sync
 
     log(f"Log: {LOG_PATH}")
 
-    # Load daily quotas and requests history at startup
+    # Load daily quotas at startup (API sync happens in load_daily_quota)
     api_requests, uploaded_bytes = load_daily_quota()
-    load_requests_history()
     uploaded_mb = uploaded_bytes / (1024 * 1024)
-    rolling_avg = get_rolling_average_requests()
+    
+    # Determine quota data source (read after load_daily_quota updates it)
+    quota_source = "local"
+    if DAILY_QUOTA_FILE.exists():
+        try:
+            with open(DAILY_QUOTA_FILE, "r") as f:
+                quota_data = json.load(f)
+                quota_source = quota_data.get("quota_source", "local")
+        except Exception:
+            pass
+    
     log(
         f"Current quotas: {api_requests}/{API_QUOTA_LIMIT} requests, {uploaded_mb:.1f} MB uploaded"
     )
-    if REQUESTS_HISTORY:
-        log(
-            f"Rolling average: {rolling_avg:.1f} requests/upload (based on {len(REQUESTS_HISTORY)} uploads)"
-        )
+    
+    if quota_source == "api":
+        log("Quota tracking: using Google Cloud Monitoring API (real usage, 2-15 min delay)")
+    elif quota_source == "manual":
+        log("Quota tracking: using manual sync value")
     else:
-        log(
-            f"Using default estimate: {REQUESTS_UPLOAD_MEAN} requests/upload (will update after first uploads)"
-        )
+        # quota_source is "local" - check if Monitoring API is actually unavailable
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
+        if project_id:
+            # Try to check if Monitoring API is available (quick test)
+            test_result = get_real_quota_usage()
+            if test_result is None:
+                log("Quota tracking: using local counter")
+                log("Note: Monitoring API sync unavailable. Check credentials/permissions.")
+            else:
+                # Monitoring API works but quota_source wasn't updated yet - will sync next time
+                log("Quota tracking: using local counter (Monitoring API available, syncing...)")
+        else:
+            log("Quota tracking: using local counter (set GOOGLE_CLOUD_PROJECT_ID for Monitoring API sync)")
+
+    # Log initial statistics (without total files count)
+    log_upload_statistics()
 
     files = list_drive_files()
     total = len(files)
     METRICS["processed_files"] = total
     log(f"Files found: {total}")
+    
+    # Log full statistics with total files count
+    log_upload_statistics(total_files=total)
 
     try:
         processed_count = 0  # Count of files actually processed (not skipped)
